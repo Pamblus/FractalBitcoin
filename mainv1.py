@@ -5,6 +5,7 @@ import base58
 import numpy as np
 import time
 import logging
+import math
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackContext
 
@@ -19,20 +20,30 @@ logger = logging.getLogger(__name__)
 
 # Функция для создания уникального узора 16x16
 def create_pattern(number, size=16):
-    # Используем хэширование для создания уникального узора
+    # Используем хэширование для увеличения уникальности
     seed = hashlib.sha256(str(number).encode()).hexdigest()
-    seed_bits = bin(int(seed, 16))[2:].zfill(256)  # Преобразуем хэш в 256 бит
+    np.random.seed(int(seed, 16) % (2**32))
 
     # Создаем пустой узор 16x16
     pattern = np.zeros((size, size), dtype=int)
 
-    # Заполняем узор на основе битов хэша
+    # Генерация узора на основе контролируемых математических формул
     for i in range(size):
         for j in range(size):
-            # Вычисляем индекс бита
-            bit_index = (i * size + j) % 256
-            # Устанавливаем значение пикселя на основе бита
-            pattern[i, j] = int(seed_bits[bit_index])
+            # Нормализуем координаты
+            x = (i - size // 2) / (size / 2)  # Диапазон от -1 до 1
+            y = (j - size // 2) / (size / 2)  # Диапазон от -1 до 1
+
+            # Используем формулу для создания узора
+            value = (
+                math.sin(x * y * 10 + number) +
+                math.cos(x * 5 + number) +
+                math.sin(y * 5 + number) +
+                math.exp(-(x**2 + y**2)) +
+                np.random.random()  # Добавляем случайность
+            )
+            # Преобразуем значение в 0 или 1
+            pattern[i, j] = 1 if value > 0.5 else 0
 
     # Делаем узор симметричным относительно центра
     pattern = np.maximum(pattern, np.flip(pattern, axis=0))  # Отражение по вертикали
@@ -43,24 +54,41 @@ def create_pattern(number, size=16):
     for row in pattern:
         visual_key += "".join(["🟩" if bit == 1 else "⬜️" for bit in row]) + "\n"
 
-    # Преобразуем узор в 256-битный ключ
-    key_data = pattern.tobytes()  # Преобразуем массив в байты
-    return visual_key, key_data
+    # Преобразуем узор в 256-битное число
+    binary_string = "".join(str(bit) for row in pattern for bit in row)
+    private_key_int = int(binary_string, 2)  # Преобразуем бинарную строку в число
+
+    # Убедимся, что приватный ключ находится в допустимом диапазоне
+    max_private_key = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+    private_key_int = private_key_int % max_private_key  # Ограничиваем диапазон
+
+    # Преобразуем число в байты (32 байта)
+    private_key = private_key_int.to_bytes(32, byteorder="big")
+
+    return visual_key, private_key
 
 # Функция для генерации приватного ключа и адреса Bitcoin
-def generate_bitcoin_address(data):
-    hash_object = hashlib.sha256(data)
-    private_key = hash_object.digest()
+def generate_bitcoin_address(private_key):
+    # Генерация публичного ключа
     sk = ecdsa.SigningKey.from_string(private_key, curve=ecdsa.SECP256k1)
     vk = sk.verifying_key
-    public_key = b"\x04" + vk.to_string()
+    public_key = b"\x04" + vk.to_string()  # Несжатый публичный ключ
+
+    # Хэшируем публичный ключ
     sha256_bpk = hashlib.sha256(public_key).digest()
     ripemd160_bpk = hashlib.new("ripemd160", sha256_bpk).digest()
+
+    # Добавляем сетевой байт (0x00 для Bitcoin)
     network_byte = b"\x00"
     hashed_public_key = network_byte + ripemd160_bpk
+
+    # Вычисляем контрольную сумму
     checksum = hashlib.sha256(hashlib.sha256(hashed_public_key).digest()).digest()[:4]
+
+    # Формируем финальный адрес
     address_bytes = hashed_public_key + checksum
     address = base58.b58encode(address_bytes).decode("utf-8")
+
     return private_key.hex(), address
 
 # Функция для проверки баланса и транзакций Bitcoin через API
@@ -179,8 +207,8 @@ async def pattern_generate(update: Update, context: CallbackContext):
 
         while True:
             # Генерация узора
-            visual_key, key_data = create_pattern(number)
-            private_key, address = generate_bitcoin_address(key_data)
+            visual_key, private_key = create_pattern(number)
+            private_key_hex, address = generate_bitcoin_address(private_key)
             balance, transactions = check_balance_and_transactions(address)
             bch_balance = check_bitcoin_cash_balance(address)
 
@@ -189,7 +217,7 @@ async def pattern_generate(update: Update, context: CallbackContext):
                 f"```\n"
                 f"Число: {number}\n"
                 f"Узор:\n{visual_key}\n"
-                f"Приватный ключ: {private_key}\n"
+                f"Приватный ключ: {private_key_hex}\n"
                 f"Адрес Bitcoin: {address}\n"
                 f"Баланс Bitcoin: {balance} сатоши\n"
                 f"Количество транзакций Bitcoin: {transactions}\n"
